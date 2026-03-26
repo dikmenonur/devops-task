@@ -1,0 +1,78 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+# NOT: Bu dosya EC2 üzerinde çalışır.
+# ECR_REGISTRY, IMAGE_TAG ve DB_* değerleri
+# GitHub Actions tarafından .env dosyasına yazılır.
+# ─────────────────────────────────────────────────────────────
+
+services:
+  # ── PostgreSQL (resmi image, ECR'ye yüklemeye gerek yok) ─────
+  db:
+    image: postgres:16-alpine
+    container_name: app_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-appdb}
+      POSTGRES_USER: ${DB_USER:-appuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-appuser} -d ${DB_NAME:-appdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # DB dışarıya açık değil - sadece internal network
+    expose:
+      - "5432"
+
+  # ── Backend (Node.js Express) ─────────────────────────────────
+  backend:
+    image: ${ECR_REGISTRY}/${PROJECT_NAME:-devops-task}-backend:${IMAGE_TAG:-latest}
+    container_name: app_backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: postgresql://${DB_USER:-appuser}:${DB_PASSWORD}@db:5432/${DB_NAME:-appdb}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - app_network
+    # 127.0.0.1 → sadece EC2 Nginx erişebilir, dışarıya kapalı
+    ports:
+      - "127.0.0.1:3001:3001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Frontend (React) ──────────────────────────────────────────
+  frontend:
+    image: ${ECR_REGISTRY}/${PROJECT_NAME:-devops-task}-frontend:${IMAGE_TAG:-latest}
+    container_name: app_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    networks:
+      - app_network
+    # 127.0.0.1 → sadece localhost erişebilir, EC2 Nginx proxy yapıyor
+    ports:
+      - "127.0.0.1:3000:80"
+
+# ─────────────────────────────────────────────────────────────
+# Volumes & Networks
+# ─────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  app_network:
+    driver: bridge

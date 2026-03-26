@@ -1,0 +1,8 @@
+# Bu dosyayı terraform/ klasörüne koyun
+# .gitignore'a ekleyin! (hassas bilgi içerebilir)
+
+aws_region   = "eu-central-1"
+project_name = "devops-task"
+
+# cat ~/.ssh/id_rsa.pub çıktısını buraya yapıştırın
+ssh_public_key = "ssh-rsa AAAA...buraya_public_key_gelecek... user@host"

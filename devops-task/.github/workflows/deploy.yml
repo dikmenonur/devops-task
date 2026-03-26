@@ -1,0 +1,203 @@
+name: 🚀 Deploy to AWS EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # Manuel tetikleme
+
+env:
+  AWS_REGION: eu-central-1
+  PROJECT_NAME: devops-task
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # JOB 1: Test (opsiyonel ama profesyonel görünüm için önemli)
+  # ──────────────────────────────────────────────────────────────
+  test:
+    name: 🧪 Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend deps & test
+        working-directory: ./backend
+        run: |
+          npm ci
+          npm test --if-present
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB 2: Build & Push Docker images to ECR
+  # ──────────────────────────────────────────────────────────────
+  build-and-push:
+    name: 🐳 Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image tag
+        id: meta
+        run: |
+          TAG="${GITHUB_SHA::8}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "📌 Image tag: ${TAG}"
+
+      - name: Build & Push Frontend image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$PROJECT_NAME-frontend:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$PROJECT_NAME-frontend:latest \
+            ./frontend
+
+          docker push $ECR_REGISTRY/$PROJECT_NAME-frontend:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$PROJECT_NAME-frontend:latest
+
+          echo "✅ Frontend image pushed: $ECR_REGISTRY/$PROJECT_NAME-frontend:$IMAGE_TAG"
+
+      - name: Build & Push Backend image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/$PROJECT_NAME-backend:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$PROJECT_NAME-backend:latest \
+            ./backend
+
+          docker push $ECR_REGISTRY/$PROJECT_NAME-backend:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$PROJECT_NAME-backend:latest
+
+          echo "✅ Backend image pushed: $ECR_REGISTRY/$PROJECT_NAME-backend:$IMAGE_TAG"
+
+  # ──────────────────────────────────────────────────────────────
+  # JOB 3: Deploy to EC2
+  # ──────────────────────────────────────────────────────────────
+  deploy:
+    name: 🎯 Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Copy files to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "docker-compose.yml,nginx/app.conf"
+          target: /opt/app
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+
+            # ─── AWS ECR Login ─────────────────────────────────
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+              docker login --username AWS --password-stdin \
+              ${{ needs.build-and-push.outputs.ecr_registry }}
+
+            # ─── Environment dosyasını oluştur ────────────────
+            cat > /opt/app/.env << EOF
+            ECR_REGISTRY=${{ needs.build-and-push.outputs.ecr_registry }}
+            PROJECT_NAME=${{ env.PROJECT_NAME }}
+            IMAGE_TAG=${{ needs.build-and-push.outputs.image_tag }}
+            DB_NAME=appdb
+            DB_USER=appuser
+            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+            JWT_SECRET=${{ secrets.JWT_SECRET }}
+            EOF
+
+            chmod 600 /opt/app/.env
+
+            # ─── Docker Compose ile deploy ────────────────────
+            cd /opt/app
+
+            # Yeni image'ları pull et
+            docker-compose pull
+
+            # Sıfır-downtime restart (db hariç)
+            docker-compose up -d --remove-orphans
+
+            # Eski image'ları temizle (disk tasarrufu)
+            docker image prune -f
+
+            # ─── Nginx konfigürasyonunu güncelle ─────────────
+            sudo cp /opt/app/nginx/app.conf /etc/nginx/sites-available/app
+            sudo ln -sf /etc/nginx/sites-available/app /etc/nginx/sites-enabled/app
+            sudo rm -f /etc/nginx/sites-enabled/default
+
+            # Nginx konfigürasyonunu test et
+            sudo nginx -t
+
+            # Nginx'i yeniden yükle (reload = sıfır downtime)
+            sudo systemctl reload nginx
+
+            echo "✅ Deployment tamamlandı!"
+            echo "📦 Image tag: ${{ needs.build-and-push.outputs.image_tag }}"
+
+      - name: Health check
+        run: |
+          echo "⏳ Uygulama başlaması bekleniyor..."
+          sleep 15
+
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://${{ secrets.EC2_HOST }}/health)
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "✅ Health check başarılı! HTTP $HTTP_STATUS"
+          else
+            echo "❌ Health check başarısız! HTTP $HTTP_STATUS"
+            exit 1
+          fi
+
+      - name: Deployment summary
+        run: |
+          echo "### 🚀 Deployment Başarılı!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Alan | Değer |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 Image Tag | \`${{ needs.build-and-push.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌐 URL | http://${{ secrets.EC2_HOST }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⏰ Zaman | $(date -u) |" >> $GITHUB_STEP_SUMMARY
